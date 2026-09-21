@@ -48,6 +48,7 @@ export async function scrapeBOT(): Promise<RateRecord[]> {
   });
 
   const lines = data.trim().split('\n');
+  console.log('抓取的 Raw CSV 前 200 字：', csvText.slice(0, 200));
   if (lines.length < 2) {
     throw new Error('台銀 CSV 資料為空或格式異常');
   }
