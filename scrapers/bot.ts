@@ -43,15 +43,15 @@ export async function scrapeBOT(): Promise<RateRecord[]> {
     timeout: 15000,
     headers: {
      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
     },
   });
 
-  const lines = data.trim().split('\n');
-  const csvText = await res.text();
-  console.log('抓取的 Raw CSV 前 200 字：', csvText.slice(0, 200));
-  if (lines.length < 2) {
-    throw new Error('台銀 CSV 資料為空或格式異常');
+  const cleanData = data.replace(/^\ufeff/, '').trim();
+  const lines = cleanData.split(/\r?\n/);
+
+  // 防護：如果抓到的是 HTML 或是無效字串
+  if (lines.length < 2 || cleanData.startsWith('<')) {
+    throw new Error('台銀回應非 CSV 格式，可能遭阻擋或網址異動');
   }
 
   const records: RateRecord[] = [];
