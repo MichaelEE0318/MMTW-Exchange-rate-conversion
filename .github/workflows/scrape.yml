@@ -28,10 +28,10 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Run scrapers
+      - name: Run Scraper
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          TZ: Asia/Taipei
+          PROXY_API_KEY: ${{ secrets.PROXY_API_KEY }}  # 👈 新增這行傳遞 Secret
         run: npm run scrape
 
       - name: Notify on failure
