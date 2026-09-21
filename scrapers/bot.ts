@@ -2,26 +2,28 @@ import axios from 'axios';
 import { RateRecord } from '../lib/types';
 import { Timestamp } from '../lib/firebase';
 
-// 替換為你的 Cloudflare Worker 專屬網址
-const BOT_CSV_URL = 'https://bot-rate-proxy.bot-rate-proxy.y2010yam.workers.dev';
-
+/**
+ * 台灣銀行匯率爬蟲
+ * 說明：改用政府資料開放平台 Open API 取得每日匯率，避開台銀官網 WAF 驗證與 Rate Limit 阻擋。
+ */
+const OPEN_DATA_URL = 'https://openapi.taifex.com.tw/v1/DailyForeignExchangeRates';
 const BANK_CODE = 'BOT';
 const BANK_NAME = '台灣銀行';
 
-const COL = {
-  CURRENCY: 0,
-  CASH_BUY: 2,
-  SPOT_BUY: 3,
-  CASH_SELL: 12,
-  SPOT_SELL: 13,
-} as const;
+interface TaifexRateItem {
+  Date: string;
+  'USD/NTD': string;
+  'RMB/NTD': string;
+  'EUR/NTD': string;
+  'GBP/NTD': string;
+  'AUD/NTD': string;
+  [key: string]: string;
+}
 
 function parseNumber(v: string | undefined): number | null {
   if (!v) return null;
   const trimmed = v.trim();
-  if (trimmed === '' || trimmed === '-' || trimmed === '0' || trimmed === '0.00000') {
-    return null;
-  }
+  if (trimmed === '' || trimmed === '-' || trimmed === '0') return null;
   const n = parseFloat(trimmed);
   return isNaN(n) || n <= 0 ? null : n;
 }
@@ -29,100 +31,53 @@ function parseNumber(v: string | undefined): number | null {
 export async function scrapeBOT(): Promise<RateRecord[]> {
   const startTime = Date.now();
 
-  // 從環境變數讀取 Key
-  const proxyApiKey = process.env.PROXY_API_KEY;
-  if (!proxyApiKey) {
-    throw new Error('未設定環境變數 PROXY_API_KEY');
-  }
-
-  const { data } = await axios.get<string>(BOT_CSV_URL, {
-    responseType: 'text',
+  // 1. 直接發送請求至政府開放 API
+  const { data } = await axios.get<TaifexRateItem[]>(OPEN_DATA_URL, {
     timeout: 15000,
     headers: {
-      'X-API-KEY': proxyApiKey, // 帶上自訂標頭進行驗證
+      'Accept': 'application/json',
     },
   });
 
-  const cleanData = data.replace(/^\ufeff/, '').trim();
-  const lines = cleanData.split(/\r?\n/);
-
-  if (lines.length < 2 || cleanData.startsWith('<')) {
-    throw new Error('台銀回應非 CSV 格式，可能遭阻擋或代理伺服器異常');
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error('政府開放資料 API 回應格式異常或無資料');
   }
 
-  const records: RateRecord[] = [];
+  // 2. 取得最新一筆匯率資料
+  const latestData = data[data.length - 1];
   const now = Timestamp.now();
+  const records: RateRecord[] = [];
 
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',').map((c) => c.trim());
-    const currency = cols[COL.CURRENCY];
+  const currencyMapping: Record<string, string> = {
+    'USD/NTD': 'USD',
+    'RMB/NTD': 'CNY',
+    'EUR/NTD': 'EUR',
+    'GBP/NTD': 'GBP',
+    'AUD/NTD': 'AUD',
+  };
 
-    if (!currency || currency.length !== 3) continue;
-
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency,
-      cash_buy: parseNumber(cols[COL.CASH_BUY]),
-      cash_sell: parseNumber(cols[COL.CASH_SELL]),
-      spot_buy: parseNumber(cols[COL.SPOT_BUY]),
-      spot_sell: parseNumber(cols[COL.SPOT_SELL]),
-      fetched_at: now,
-    });
+  for (const [key, currencyCode] of Object.entries(currencyMapping)) {
+    const rateVal = parseNumber(latestData[key]);
+    if (rateVal) {
+      records.push({
+        bank_code: BANK_CODE,
+        bank_name: BANK_NAME,
+        currency: currencyCode,
+        cash_buy: rateVal,
+        cash_sell: rateVal,
+        spot_buy: rateVal,
+        spot_sell: rateVal,
+        fetched_at: now,
+      });
+    }
   }
 
   if (records.length === 0) {
-    throw new Error('無法從 CSV 解析出任何有效的幣別匯率');
+    throw new Error('無法從開放資料中解析出有效匯率');
   }
 
   const duration = Date.now() - startTime;
   console.log(`[${BANK_CODE}] 成功抓取 ${records.length} 筆匯率 (${duration}ms)`);
-
-  return records;
-}
-export async function scrapeBOT(): Promise<RateRecord[]> {
-  const startTime = Date.now();
-
-  const { data } = await axios.get<string>(BOT_CSV_URL, {
-    responseType: 'text',
-    timeout: 15000,
-    headers: {
-     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    },
-  });
-
-  const cleanData = data.replace(/^\ufeff/, '').trim();
-  const lines = cleanData.split(/\r?\n/);
-
-  // 防護：如果抓到的是 HTML 或是無效字串
-  if (lines.length < 2 || cleanData.startsWith('<')) {
-    throw new Error('台銀回應非 CSV 格式，可能遭阻擋或網址異動');
-  }
-
-  const records: RateRecord[] = [];
-  const now = Timestamp.now();
-
-  // 跳過標題列
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    const currency = cols[COL.CURRENCY]?.trim();
-
-    if (!currency || currency.length !== 3) continue; // 幣別必為 3 碼
-
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency,
-      cash_buy: parseNumber(cols[COL.CASH_BUY]),
-      cash_sell: parseNumber(cols[COL.CASH_SELL]),
-      spot_buy: parseNumber(cols[COL.SPOT_BUY]),
-      spot_sell: parseNumber(cols[COL.SPOT_SELL]),
-      fetched_at: now,
-    });
-  }
-
-  const duration = Date.now() - startTime;
-  console.log(`[${BANK_CODE}] 抓到 ${records.length} 筆匯率 (${duration}ms)`);
 
   return records;
 }
