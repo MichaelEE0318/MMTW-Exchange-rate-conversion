@@ -1,0 +1,39 @@
+name: Scrape Exchange Rates
+
+on:
+  schedule:
+    # 台灣時間 08:00-18:00（UTC 00:00-10:00），週一到週五，每 10 分鐘
+    - cron: '*/10 0-10 * * 1-5'
+    # 其他時間每小時整點跑一次
+    - cron: '0 11-23 * * 1-5'
+    - cron: '0 * * * 0,6'
+  # 允許手動觸發（Actions 頁面按 Run workflow）
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run scrapers
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          TZ: Asia/Taipei
+        run: npm run scrape
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "::warning::匯率爬蟲執行失敗，請檢查 log"
