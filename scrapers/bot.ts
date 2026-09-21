@@ -2,39 +2,84 @@ import axios from 'axios';
 import { RateRecord } from '../lib/types';
 import { Timestamp } from '../lib/firebase';
 
-/**
- * 台灣銀行匯率爬蟲
- *
- * 資料來源：台銀官方 CSV 端點
- * https://rate.bot.com.tw/xrt/flcsv/0/day
- *
- * CSV 格式（節錄）：
- *   幣別,現金買入,現金賣出,即期買入,即期賣出,遠期10天...
- *   USD,31.85,32.52,32.20,32.30,...
- */
+// 替換為你的 Cloudflare Worker 專屬網址
+const BOT_CSV_URL = 'https://bot-rate-proxy.bot-rate-proxy.y2010yam.workers.dev';
 
-const BOT_CSV_URL = 'https://rate.bot.com.tw/xrt/flcsv/0/day';
 const BANK_CODE = 'BOT';
 const BANK_NAME = '台灣銀行';
 
-// 台銀 CSV 的欄位索引（0-based）
 const COL = {
   CURRENCY: 0,
   CASH_BUY: 2,
-  CASH_SELL: 12,
   SPOT_BUY: 3,
+  CASH_SELL: 12,
   SPOT_SELL: 13,
 } as const;
 
 function parseNumber(v: string | undefined): number | null {
   if (!v) return null;
   const trimmed = v.trim();
-  // 台銀對某些幣別的現金匯率會顯示為 0 或 "-"，代表不提供
-  if (trimmed === '' || trimmed === '-' || trimmed === '0') return null;
+  if (trimmed === '' || trimmed === '-' || trimmed === '0' || trimmed === '0.00000') {
+    return null;
+  }
   const n = parseFloat(trimmed);
   return isNaN(n) || n <= 0 ? null : n;
 }
 
+export async function scrapeBOT(): Promise<RateRecord[]> {
+  const startTime = Date.now();
+
+  // 從環境變數讀取 Key
+  const proxyApiKey = process.env.PROXY_API_KEY;
+  if (!proxyApiKey) {
+    throw new Error('未設定環境變數 PROXY_API_KEY');
+  }
+
+  const { data } = await axios.get<string>(BOT_CSV_URL, {
+    responseType: 'text',
+    timeout: 15000,
+    headers: {
+      'X-API-KEY': proxyApiKey, // 帶上自訂標頭進行驗證
+    },
+  });
+
+  const cleanData = data.replace(/^\ufeff/, '').trim();
+  const lines = cleanData.split(/\r?\n/);
+
+  if (lines.length < 2 || cleanData.startsWith('<')) {
+    throw new Error('台銀回應非 CSV 格式，可能遭阻擋或代理伺服器異常');
+  }
+
+  const records: RateRecord[] = [];
+  const now = Timestamp.now();
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',').map((c) => c.trim());
+    const currency = cols[COL.CURRENCY];
+
+    if (!currency || currency.length !== 3) continue;
+
+    records.push({
+      bank_code: BANK_CODE,
+      bank_name: BANK_NAME,
+      currency,
+      cash_buy: parseNumber(cols[COL.CASH_BUY]),
+      cash_sell: parseNumber(cols[COL.CASH_SELL]),
+      spot_buy: parseNumber(cols[COL.SPOT_BUY]),
+      spot_sell: parseNumber(cols[COL.SPOT_SELL]),
+      fetched_at: now,
+    });
+  }
+
+  if (records.length === 0) {
+    throw new Error('無法從 CSV 解析出任何有效的幣別匯率');
+  }
+
+  const duration = Date.now() - startTime;
+  console.log(`[${BANK_CODE}] 成功抓取 ${records.length} 筆匯率 (${duration}ms)`);
+
+  return records;
+}
 export async function scrapeBOT(): Promise<RateRecord[]> {
   const startTime = Date.now();
 
