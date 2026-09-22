@@ -4,16 +4,15 @@ on:
   schedule:
     # 台灣時間 08:00-18:00（UTC 00:00-10:00），週一到週五，每 10 分鐘
     - cron: '*/10 0-10 * * 1-5'
-    # 其他時間每小時整點跑一次
+    # 其餘時間每小時
     - cron: '0 11-23 * * 1-5'
     - cron: '0 * * * 0,6'
-  # 允許手動觸發（Actions 頁面按 Run workflow）
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -25,13 +24,36 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Get Playwright version
+        id: playwright-version
+        run: |
+          VERSION=$(node -p "require('./package.json').devDependencies?.playwright || require('./package.json').dependencies.playwright")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Run Scraper
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install dependencies (skip postinstall)
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npm install --ignore-scripts
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright system deps (cache hit only)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Run scrapers
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          PROXY_API_KEY: ${{ secrets.PROXY_API_KEY }}  # 👈 新增這行傳遞 Secret
+          TZ: Asia/Taipei
         run: npm run scrape
 
       - name: Notify on failure
