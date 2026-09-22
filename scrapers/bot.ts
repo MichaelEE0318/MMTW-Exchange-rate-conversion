@@ -4,148 +4,85 @@ import { newContext } from '../lib/browser.js';
 import { parseRateNumber, extractCurrencyCode } from '../lib/parser.js';
 
 /**
- * 台灣銀行匯率爬蟲（Playwright 版）
+ * 台灣銀行匯率爬蟲（Playwright + HTML 表格）
  *
  * 資料來源：https://rate.bot.com.tw/xrt?Lang=zh-TW
  *
- * 網頁結構：
- *   <table class="table table-striped ...">
- *     <thead>幣別 現金買入 現金賣出 即期買入 即期賣出</thead>
+ * 網頁結構（實測）：
+ *   <table title="牌告匯率">
  *     <tbody>
  *       <tr>
  *         <td>美金 (USD)</td>
- *         <td>31.85</td> <td>32.52</td>
- *         <td>32.20</td> <td>32.30</td>
+ *         <td data-table="本行現金買入">31.85</td>
+ *         <td data-table="本行現金賣出">32.52</td>
+ *         <td data-table="本行即期買入">32.20</td>
+ *         <td data-table="本行即期賣出">32.30</td>
  *         ...
  *       </tr>
  *     </tbody>
  *   </table>
  *
  * 策略：
- *   1. 先嘗試用 Playwright 的 request context 打 CSV 端點（快、便宜）
- *   2. 若失敗（被擋、格式錯），fallback 到 full browser 開 HTML 頁
+ *   - 用 title="牌告匯率" 定位表格（比 class 穩，改版機率極低）
+ *   - 用 data-table 屬性抓欄位（比欄位順序穩）
+ *   - CSV 端點已知在 GitHub Actions 海外 IP 被擋，直接跳過
  */
 
 const BANK_CODE = 'BOT';
 const BANK_NAME = '台灣銀行';
 const BOT_HTML_URL = 'https://rate.bot.com.tw/xrt?Lang=zh-TW';
-const BOT_CSV_URL = 'https://rate.bot.com.tw/xrt/flcsv/0/day';
+
+// 台銀 td 的 data-table 屬性值 → 我們的欄位名
+const FIELD_MAP = {
+  cash_buy: '本行現金買入',
+  cash_sell: '本行現金賣出',
+  spot_buy: '本行即期買入',
+  spot_sell: '本行即期賣出',
+} as const;
 
 export async function scrapeBOT(): Promise<RateRecord[]> {
   const startTime = Date.now();
-
-  // 策略 1：Playwright request context 嘗試 CSV（帶 real browser headers）
-  const csvResult = await tryFetchCsv();
-  if (csvResult && csvResult.length > 0) {
-    const duration = Date.now() - startTime;
-    console.log(
-      `[${BANK_CODE}] ✅ CSV 模式抓到 ${csvResult.length} 筆 (${duration}ms)`,
-    );
-    return csvResult;
-  }
-
-  console.log(`[${BANK_CODE}] ⚠️  CSV 模式失敗，改用瀏覽器渲染 HTML`);
-
-  // 策略 2：Full browser 抓 HTML 表格
-  const htmlResult = await scrapeHtml();
-  const duration = Date.now() - startTime;
-  console.log(
-    `[${BANK_CODE}] ✅ HTML 模式抓到 ${htmlResult.length} 筆 (${duration}ms)`,
-  );
-  return htmlResult;
-}
-
-// ─────────────────────────────────────────────
-// 策略 1：CSV 端點（用 Playwright request 帶 real browser headers）
-// ─────────────────────────────────────────────
-async function tryFetchCsv(): Promise<RateRecord[] | null> {
-  const context = await newContext();
-  try {
-    // 先訪問首頁拿 cookie，模擬正常使用者
-    const page = await context.newPage();
-    await page.goto(BOT_HTML_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await page.waitForTimeout(500);
-
-    // 用同一個 context 打 CSV（帶著 cookie）
-    const response = await context.request.get(BOT_CSV_URL, {
-      headers: {
-        Referer: BOT_HTML_URL,
-      },
-      timeout: 15000,
-    });
-
-    if (!response.ok()) return null;
-
-    const csvText = await response.text();
-    // 檢查是不是真的 CSV（有時被擋會回傳 HTML 錯誤頁）
-    if (!csvText.includes(',') || csvText.includes('<html')) return null;
-
-    return parseCsv(csvText);
-  } catch (err) {
-    console.log(`[${BANK_CODE}] CSV 嘗試失敗:`, (err as Error).message);
-    return null;
-  } finally {
-    await context.close();
-  }
-}
-
-function parseCsv(csvText: string): RateRecord[] {
-  const lines = csvText.trim().split('\n');
-  if (lines.length < 2) return [];
-
-  const records: RateRecord[] = [];
-  const now = Timestamp.now();
-
-  // 台銀 CSV 欄位：幣別, ?, 現金買入, 即期買入, ..., 現金賣出, ..., 即期賣出
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    const currency = cols[0]?.trim();
-    if (!currency || currency.length !== 3) continue;
-
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency,
-      cash_buy: parseRateNumber(cols[2]),
-      spot_buy: parseRateNumber(cols[3]),
-      cash_sell: parseRateNumber(cols[12]),
-      spot_sell: parseRateNumber(cols[13]),
-      fetched_at: now,
-    });
-  }
-  return records;
-}
-
-// ─────────────────────────────────────────────
-// 策略 2：開 Chromium 抓 HTML 表格
-// ─────────────────────────────────────────────
-async function scrapeHtml(): Promise<RateRecord[]> {
   const context = await newContext();
   const page = await context.newPage();
 
   try {
     await page.goto(BOT_HTML_URL, {
-      waitUntil: 'networkidle',
+      waitUntil: 'domcontentloaded',
       timeout: 30000,
     });
 
-    // 等匯率表格出現
-    await page.waitForSelector('table.table-striped tbody tr', {
-      timeout: 10000,
+    // 等表格出現 - 用 title 屬性選取，比 class 穩
+    await page.waitForSelector('table[title="牌告匯率"]', {
+      timeout: 15000,
     });
 
-    // 抓每一列（td 欄位順序見官網）
-    const rows = await page.$$eval('table.table-striped tbody tr', (trs) =>
-      trs.map((tr) => {
-        const tds = Array.from(tr.querySelectorAll('td'));
-        return {
-          currency_raw: tds[0]?.textContent?.trim() ?? '',
-          cash_buy: tds[1]?.textContent?.trim() ?? '',
-          cash_sell: tds[2]?.textContent?.trim() ?? '',
-          spot_buy: tds[3]?.textContent?.trim() ?? '',
-          spot_sell: tds[4]?.textContent?.trim() ?? '',
-        };
-      }),
+    await page.waitForSelector('table[title="牌告匯率"] tbody tr', {
+      timeout: 5000,
+    });
+
+    const rows = await page.$$eval(
+      'table[title="牌告匯率"] tbody tr',
+      (trs, fieldMap) => {
+        return trs.map((tr) => {
+          const firstTd = tr.querySelector('td');
+          const currency_raw =
+            firstTd?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+
+          const getByAttr = (attr: string): string => {
+            const el = tr.querySelector(`td[data-table="${attr}"]`);
+            return el?.textContent?.trim() ?? '';
+          };
+
+          return {
+            currency_raw,
+            cash_buy: getByAttr(fieldMap.cash_buy),
+            cash_sell: getByAttr(fieldMap.cash_sell),
+            spot_buy: getByAttr(fieldMap.spot_buy),
+            spot_sell: getByAttr(fieldMap.spot_sell),
+          };
+        });
+      },
+      FIELD_MAP,
     );
 
     const now = Timestamp.now();
@@ -167,6 +104,17 @@ async function scrapeHtml(): Promise<RateRecord[]> {
       });
     }
 
+    // 若一筆都沒抓到，明確 throw 並印出 debug 資訊
+    if (records.length === 0) {
+      const html = await page.content();
+      const snippet = html.slice(0, 800).replace(/\s+/g, ' ');
+      throw new Error(
+        `解析後 0 筆資料。可能網頁改版，頁面前 800 字：${snippet}`,
+      );
+    }
+
+    const duration = Date.now() - startTime;
+    console.log(`[${BANK_CODE}] ✅ 抓到 ${records.length} 筆匯率 (${duration}ms)`);
     return records;
   } finally {
     await context.close();
