@@ -1,20 +1,13 @@
-import { db } from './firebase';
-import { RateRecord } from './types';
+import { db } from './firebase.js';
+import { RateRecord } from './types.js';
 
-/**
- * 寫入匯率資料到 Firestore
- *   - rates_latest: 每家銀行每幣別只保留一筆（覆寫）
- *   - rates_history: 時間序列，保留 30 天（清理由另一支 job 處理）
- *
- * 使用 batch write 提升效能與原子性；Firestore batch 上限 500 筆。
- */
 export async function writeRates(records: RateRecord[]): Promise<void> {
   if (records.length === 0) {
     console.warn('⚠️  無資料可寫入');
     return;
   }
 
-  const CHUNK_SIZE = 200; // 每筆會產生 2 個 write (latest + history)，200 * 2 = 400 < 500
+  const CHUNK_SIZE = 200;
 
   for (let i = 0; i < records.length; i += CHUNK_SIZE) {
     const chunk = records.slice(i, i + CHUNK_SIZE);

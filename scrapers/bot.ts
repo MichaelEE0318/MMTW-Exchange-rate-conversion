@@ -1,173 +1,174 @@
-import axios from 'axios';
-import { RateRecord } from '../lib/types';
-import { Timestamp } from '../lib/firebase';
+import { RateRecord } from '../lib/types.js';
+import { Timestamp } from '../lib/firebase.js';
+import { newContext } from '../lib/browser.js';
+import { parseRateNumber, extractCurrencyCode } from '../lib/parser.js';
 
 /**
- * 台灣銀行匯率爬蟲 - 政府資料開放平台 (dataset/11339) 官方 Open API
- * 說明：直連開放平台端點，免過 WAF 防火牆，一次拿齊 19 種完整對台幣匯率
+ * 台灣銀行匯率爬蟲（Playwright 版）
+ *
+ * 資料來源：https://rate.bot.com.tw/xrt?Lang=zh-TW
+ *
+ * 網頁結構：
+ *   <table class="table table-striped ...">
+ *     <thead>幣別 現金買入 現金賣出 即期買入 即期賣出</thead>
+ *     <tbody>
+ *       <tr>
+ *         <td>美金 (USD)</td>
+ *         <td>31.85</td> <td>32.52</td>
+ *         <td>32.20</td> <td>32.30</td>
+ *         ...
+ *       </tr>
+ *     </tbody>
+ *   </table>
+ *
+ * 策略：
+ *   1. 先嘗試用 Playwright 的 request context 打 CSV 端點（快、便宜）
+ *   2. 若失敗（被擋、格式錯），fallback 到 full browser 開 HTML 頁
  */
-const GOV_DATA_BOT_URL = 'https://openapi.taifex.com.tw/v1/DailyForeignExchangeRates';
+
 const BANK_CODE = 'BOT';
 const BANK_NAME = '台灣銀行';
-
-// 常用幣別對應表
-const CURRENCY_MAP: Record<string, string> = {
-  'USD/NTD': 'USD',
-  'RMB/NTD': 'CNY',
-  'EUR/USD': 'EUR',
-  'USD/JPY': 'JPY',
-  'GBP/USD': 'GBP',
-  'AUD/USD': 'AUD',
-  'USD/HKD': 'HKD',
-  'USD/SGD': 'SGD',
-  'USD/CAD': 'CAD',
-  'USD/CHF': 'CHF',
-  'NZD/USD': 'NZD',
-  'USD/THB': 'THB',
-  'USD/KRW': 'KRW',
-};
-
-function parseNumber(v: any): number | null {
-  if (v === undefined || v === null) return null;
-  const trimmed = String(v).trim();
-  if (trimmed === '' || trimmed === '-' || trimmed === '0' || trimmed === '0.00000') {
-    return null;
-  }
-  const n = parseFloat(trimmed);
-  return isNaN(n) || n <= 0 ? null : n;
-}
+const BOT_HTML_URL = 'https://rate.bot.com.tw/xrt?Lang=zh-TW';
+const BOT_CSV_URL = 'https://rate.bot.com.tw/xrt/flcsv/0/day';
 
 export async function scrapeBOT(): Promise<RateRecord[]> {
   const startTime = Date.now();
 
-  const { data } = await axios.get<any[]>(GOV_DATA_BOT_URL, {
-    timeout: 15000,
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    },
-  });
-
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error('政府開放資料 API 回應無資料');
+  // 策略 1：Playwright request context 嘗試 CSV（帶 real browser headers）
+  const csvResult = await tryFetchCsv();
+  if (csvResult && csvResult.length > 0) {
+    const duration = Date.now() - startTime;
+    console.log(
+      `[${BANK_CODE}] ✅ CSV 模式抓到 ${csvResult.length} 筆 (${duration}ms)`,
+    );
+    return csvResult;
   }
 
-  // 取最新一天資料
-  const latestRow = data[data.length - 1];
-  const now = Timestamp.now();
-  const records: RateRecord[] = [];
+  console.log(`[${BANK_CODE}] ⚠️  CSV 模式失敗，改用瀏覽器渲染 HTML`);
 
-  // 先取得基礎的 美元對台幣 (USD/NTD) 匯率
-  const usdNtd = parseNumber(latestRow['USD/NTD']);
-
-  if (!usdNtd) {
-    throw new Error('無法從開放資料中取得 USD/NTD 基礎匯率');
-  }
-
-  // 1. 先塞入直接對台幣的幣別
-  records.push({
-    bank_code: BANK_CODE,
-    bank_name: BANK_NAME,
-    currency: 'USD',
-    cash_buy: usdNtd,
-    cash_sell: usdNtd,
-    spot_buy: usdNtd,
-    spot_sell: usdNtd,
-    fetched_at: now,
-  });
-
-  const rmbNtd = parseNumber(latestRow['RMB/NTD']);
-  if (rmbNtd) {
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency: 'CNY',
-      cash_buy: rmbNtd,
-      cash_sell: rmbNtd,
-      spot_buy: rmbNtd,
-      spot_sell: rmbNtd,
-      fetched_at: now,
-    });
-  }
-
-  // 2. 自動計算交叉匯率轉換為各幣別對新台幣 (NTD)
-  const eurUsd = parseNumber(latestRow['EUR/USD']);
-  if (eurUsd) {
-    const eurNtd = Number((eurUsd * usdNtd).toFixed(4));
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency: 'EUR',
-      cash_buy: eurNtd,
-      cash_sell: eurNtd,
-      spot_buy: eurNtd,
-      spot_sell: eurNtd,
-      fetched_at: now,
-    });
-  }
-
-  const gbpUsd = parseNumber(latestRow['GBP/USD']);
-  if (gbpUsd) {
-    const gbpNtd = Number((gbpUsd * usdNtd).toFixed(4));
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency: 'GBP',
-      cash_buy: gbpNtd,
-      cash_sell: gbpNtd,
-      spot_buy: gbpNtd,
-      spot_sell: gbpNtd,
-      fetched_at: now,
-    });
-  }
-
-  const audUsd = parseNumber(latestRow['AUD/USD']);
-  if (audUsd) {
-    const audNtd = Number((audUsd * usdNtd).toFixed(4));
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency: 'AUD',
-      cash_buy: audNtd,
-      cash_sell: audNtd,
-      spot_buy: audNtd,
-      spot_sell: audNtd,
-      fetched_at: now,
-    });
-  }
-
-  const usdJpy = parseNumber(latestRow['USD/JPY']);
-  if (usdJpy) {
-    const jpyNtd = Number((usdNtd / usdJpy).toFixed(4));
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency: 'JPY',
-      cash_buy: jpyNtd,
-      cash_sell: jpyNtd,
-      spot_buy: jpyNtd,
-      spot_sell: jpyNtd,
-      fetched_at: now,
-    });
-  }
-
-  const usdHkd = parseNumber(latestRow['USD/HKD']);
-  if (usdHkd) {
-    const hkdNtd = Number((usdNtd / usdHkd).toFixed(4));
-    records.push({
-      bank_code: BANK_CODE,
-      bank_name: BANK_NAME,
-      currency: 'HKD',
-      cash_buy: hkdNtd,
-      cash_sell: hkdNtd,
-      spot_buy: hkdNtd,
-      spot_sell: hkdNtd,
-      fetched_at: now,
-    });
-  }
-
+  // 策略 2：Full browser 抓 HTML 表格
+  const htmlResult = await scrapeHtml();
   const duration = Date.now() - startTime;
-  console.log(`[${BANK_CODE}] 成功抓取 ${records.length} 筆完整匯率 (${duration}ms)`);
+  console.log(
+    `[${BANK_CODE}] ✅ HTML 模式抓到 ${htmlResult.length} 筆 (${duration}ms)`,
+  );
+  return htmlResult;
+}
 
+// ─────────────────────────────────────────────
+// 策略 1：CSV 端點（用 Playwright request 帶 real browser headers）
+// ─────────────────────────────────────────────
+async function tryFetchCsv(): Promise<RateRecord[] | null> {
+  const context = await newContext();
+  try {
+    // 先訪問首頁拿 cookie，模擬正常使用者
+    const page = await context.newPage();
+    await page.goto(BOT_HTML_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(500);
+
+    // 用同一個 context 打 CSV（帶著 cookie）
+    const response = await context.request.get(BOT_CSV_URL, {
+      headers: {
+        Referer: BOT_HTML_URL,
+      },
+      timeout: 15000,
+    });
+
+    if (!response.ok()) return null;
+
+    const csvText = await response.text();
+    // 檢查是不是真的 CSV（有時被擋會回傳 HTML 錯誤頁）
+    if (!csvText.includes(',') || csvText.includes('<html')) return null;
+
+    return parseCsv(csvText);
+  } catch (err) {
+    console.log(`[${BANK_CODE}] CSV 嘗試失敗:`, (err as Error).message);
+    return null;
+  } finally {
+    await context.close();
+  }
+}
+
+function parseCsv(csvText: string): RateRecord[] {
+  const lines = csvText.trim().split('\n');
+  if (lines.length < 2) return [];
+
+  const records: RateRecord[] = [];
+  const now = Timestamp.now();
+
+  // 台銀 CSV 欄位：幣別, ?, 現金買入, 即期買入, ..., 現金賣出, ..., 即期賣出
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    const currency = cols[0]?.trim();
+    if (!currency || currency.length !== 3) continue;
+
+    records.push({
+      bank_code: BANK_CODE,
+      bank_name: BANK_NAME,
+      currency,
+      cash_buy: parseRateNumber(cols[2]),
+      spot_buy: parseRateNumber(cols[3]),
+      cash_sell: parseRateNumber(cols[12]),
+      spot_sell: parseRateNumber(cols[13]),
+      fetched_at: now,
+    });
+  }
   return records;
+}
+
+// ─────────────────────────────────────────────
+// 策略 2：開 Chromium 抓 HTML 表格
+// ─────────────────────────────────────────────
+async function scrapeHtml(): Promise<RateRecord[]> {
+  const context = await newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(BOT_HTML_URL, {
+      waitUntil: 'networkidle',
+      timeout: 30000,
+    });
+
+    // 等匯率表格出現
+    await page.waitForSelector('table.table-striped tbody tr', {
+      timeout: 10000,
+    });
+
+    // 抓每一列（td 欄位順序見官網）
+    const rows = await page.$$eval('table.table-striped tbody tr', (trs) =>
+      trs.map((tr) => {
+        const tds = Array.from(tr.querySelectorAll('td'));
+        return {
+          currency_raw: tds[0]?.textContent?.trim() ?? '',
+          cash_buy: tds[1]?.textContent?.trim() ?? '',
+          cash_sell: tds[2]?.textContent?.trim() ?? '',
+          spot_buy: tds[3]?.textContent?.trim() ?? '',
+          spot_sell: tds[4]?.textContent?.trim() ?? '',
+        };
+      }),
+    );
+
+    const now = Timestamp.now();
+    const records: RateRecord[] = [];
+
+    for (const row of rows) {
+      const currency = extractCurrencyCode(row.currency_raw);
+      if (!currency) continue;
+
+      records.push({
+        bank_code: BANK_CODE,
+        bank_name: BANK_NAME,
+        currency,
+        cash_buy: parseRateNumber(row.cash_buy),
+        cash_sell: parseRateNumber(row.cash_sell),
+        spot_buy: parseRateNumber(row.spot_buy),
+        spot_sell: parseRateNumber(row.spot_sell),
+        fetched_at: now,
+      });
+    }
+
+    return records;
+  } finally {
+    await context.close();
+  }
 }
